@@ -1,0 +1,7 @@
+description = "How triple stores really behave, and how to write queries and shapes that run in reasonable time"
+visibility = "public"
+rules = []
+[families]
+TSD = { pattern = 'TSD-\d+[a-z]?', rule = "heading", type = "discovery", defined = "findings.md" }
+TSDQ = { pattern = 'TSD-Q\d+', type = "discovery", defined = "findings.md" }
+RDF = { defined = "query-standards.md", type = "standard" }
