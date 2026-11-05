@@ -5,3 +5,10 @@ rules = []
 TSD = { pattern = 'TSD-\d+[a-z]?', rule = "heading", type = "discovery", defined = "findings.md" }
 TSDQ = { pattern = 'TSD-Q\d+', type = "discovery", defined = "findings.md" }
 RDF = { defined = "query-standards.md", type = "standard" }
+
+[skill_values]
+discovery_record = "the findings of this domain (`findings.md`), and the project's own discovery record where it keeps one"
+upstream_reports = "the project's upstream report notes"
+benchmark_root = "benchmark/"
+maintainer = "the maintainer"
+shared_fixtures = "conftest.py"
