@@ -1717,6 +1717,25 @@ To see it, run `pyoxigraph.Store().update("PREFIX a: <urn:a#>\nINSERT DATA { GRA
 
 **What the store does.** Parsed into a Jena `Dataset`, an empty graph block leaves no graph behind, so `containsNamedModel` answers false for it. A dataset has no way to hold a named graph that holds no triple, and Fuseki's datasets behave the same. `RDFParser.fromString("<urn:g> { }", Lang.TRIG).toDataset().containsNamedModel("urn:g")` answers false.
 
+### TSD-70. No store compares an `owl:rational` literal by value
+
+**Evidence:** Observed on rdflib 7.6.0, Oxigraph 0.5.13 and Jena ARQ 5.1.0 in memory, 2026-11-08, with the probe below, while choosing how a ledger records an exact proportion. Not read from any engine's source.
+
+**Context.** OWL 2 defines `owl:rational`, whose lexical form is a fraction such as `"1/3"`, and a record that keeps an exact share would state it so, if a store could compare it.
+
+**What the store does.** All three parse the literal, keep its lexical form and datatype, and write it back unchanged. None treats it as a number.
+
+| Probe, over `"1/3"`, `"2/6"` and `"1/2"`, each `^^owl:rational` | rdflib | Oxigraph | Jena ARQ |
+|---|---|---|---|
+| parse, then write and read again | lexical form and datatype kept | lexical form and datatype kept | lexical form and datatype kept |
+| `FILTER (?o = "1/3"^^owl:rational)` | matches `"1/3"` only | matches `"1/3"` only | matches `"1/3"` only |
+| `FILTER (?o < "1/2"^^owl:rational)` | matches nothing | matches nothing | matches nothing |
+| rdflib `Literal.eq` between `"1/3"` and `"2/6"` | raises `TypeError` | | |
+
+So `"1/3"` and `"2/6"` are different terms and never equal values, and an order comparison is an error that drops the solution. A shape or query that must compare or sum a proportion cannot use the literal, and two `xsd:integer` values, a numerator and a denominator, compare by cross-multiplication on every store.
+
+To see it, load the three triples `<urn:a> <urn:p> "1/3"^^<http://www.w3.org/2002/07/owl#rational>` (and `"2/6"`, `"1/2"`) into each store and run the two filters.
+
 ## 7. Corrections, and what they taught us
 
 ### 7.1 rdflib and the order of an update (TSD-01)
