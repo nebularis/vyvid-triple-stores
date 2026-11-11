@@ -222,7 +222,7 @@ The two are not interchangeable. Some functions accept only a variable (`BOUND`)
 | [TSD-66](#tsd-66-jena-tdb2-and-fuseki-over-it-apply-an-update-as-arq-in-memory-does-roll-back-a-request-whose-second-operation-fails-and-apply-a-request-the-client-abandoned) | TSD-53's order and skip, TSD-06's failing request, a blank node in a template, and an abandoned request, on TDB2 and Fuseki | all deletions then all insertions, the quad skipped, a request should be atomic, a blank node minted per solution | not applicable | not applicable | Source and Observed (Jena 5.1.0, TDB2 on disk, Fuseki main over HTTP) |
 | [TSD-67](#tsd-67-rdf4j-610s-memorystore-applies-a-deleteinsert-one-solution-at-a-time-writes-a-template-quad-whose-graph-is-unbound-and-rolls-back-a-request-whose-second-operation-fails) | TSD-01, TSD-05 and TSD-06 on RDF4J, and a generated composite replace | as those, and the replace should leave only the payload | not applicable | not applicable | Observed (RDF4J 6.1.0 MemoryStore): ✘ per solution, ✘ the quad written, rolls back. ✘ the composite replace leaves the old members and the old head (addendum) |
 | [TSD-71](#tsd-71-an-optional-join-and-a-union-that-stands-for-it-cost-differently-on-each-engine) | an `OPTIONAL` join against a `UNION` standing for it, in a summed read | not specified | `OPTIONAL` 1.2 times the plain sum, `UNION` 6.0 | `OPTIONAL` 4.1, `UNION` 1.7 (0.5.13) | Observed |
-| [TSD-72](#tsd-72-a-running-balance-clamped-at-a-ceiling-is-not-one-sparql-query-and-the-ordered-read-that-replaces-it) | a running balance clamped at a ceiling | not expressible in SPARQL 1.1 | an ordered read folded by the caller, 1.2 to 1.6 times the sum | the same, 1.9 to 2.0 times (0.5.13) | Reasoned, Observed |
+| [TSD-72](#tsd-72-a-running-balance-clamped-at-a-ceiling-is-not-one-sparql-query-and-the-ordered-read-that-replaces-it) | a running balance clamped at a ceiling | not expressible in SPARQL 1.1 | an ordered read folded by the caller, 1.2 to 1.6 times the sum | the same, 1.9 to 2.0 times (0.5.13). Jena from Java, 1.7 to 2.6 | Reasoned, Observed |
 
 ## 6. The findings
 
@@ -1759,6 +1759,8 @@ A single read of one subtree on Oxigraph, outside the committed run, took about 
 
 **What it means for a project.** The cheaper form of an optional join is a property of the engine, so a generated read that must run on several engines either chooses its form per engine or accepts a factor of 4 to 6 on one of them. Check that a `UNION` written for an `OPTIONAL` keeps every row the `OPTIONAL` keeps.
 
+**Addendum, 2026-11-11, the corrected form and a second instance.** With a third branch keeping a credit that has no kind, `{ ?p :direction :Credit . FILTER NOT EXISTS { ?p :kind ?z } }`, the `UNION` form costs 0.2 to 0.4 of the plain read more than before, and each engine's cheaper form is unchanged. Factor against the plain read, 5,000 postings, 30% credits: rdflib `OPTIONAL` 1.7 and `UNION` 6.6, Oxigraph 4.1 and 2.1, Jena ARQ in memory called from Java 1.3 and 2.1, Jena TDB2 called from Java 1.3 and 2.5. The same benchmark found a second instance on Oxigraph: an ordered read with `OPTIONAL { ?p :applied ?ap }` gained almost nothing from a checkpoint that cut every other read on every engine to 0.02 to 0.05 of its cost, which suggests the `OPTIONAL` scans beyond the named graphs it is given. Neither instance was confirmed from a plan (TSD-Q37).
+
 **Reproduce it.** `mise run check:ledger-credit-kinds` in LATTICE, with `LEDGER_KINDS_FORM=optional` or `union` to force one form on every engine.
 
 ### TSD-72. A running balance clamped at a ceiling is not one SPARQL query, and the ordered read that replaces it
@@ -1776,6 +1778,8 @@ A single read of one subtree on Oxigraph, outside the committed run, took about 
 The Jena figure includes every row crossing a pipe between processes, which a caller in the JVM would not pay, so it is an upper bound until a native run is recorded.
 
 **What it means for a project.** A read that must apply a ceiling step by step moves every row it folds out of the store. On rdflib and Oxigraph that costs about what a filtered aggregate costs. A checkpoint bounds the rows the same way it bounds a sum.
+
+**Addendum, 2026-11-11, a caller in the JVM.** Called natively from Java, the ordered read and fold costs 1.9, 2.4 and 2.6 times the plain sum on Jena ARQ in memory and 1.7, 1.8 and 2.0 times on Jena TDB2, for 1,000, 5,000 and 20,000 postings, about half what the pipe gave. The transfer of rows into Java took 2 to 3 ms at 20,000 postings, and the fold loop under a millisecond on every engine and caller, so the cost is the engine's ordered query.
 
 **Reproduce it.** As TSD-71.
 
