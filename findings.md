@@ -221,6 +221,8 @@ The two are not interchangeable. Some functions accept only a variable (`BOUND`)
 | [TSD-65](#tsd-65-a-deleteinsert-fills-every-template-quad-once-per-solution-on-every-engine-measured-whether-or-not-the-quad-is-then-skipped-and-only-jena-applies-a-quad-with-no-variable-once-per-operation) | what a generated replace and four other forms cost at M = N up to 10,000, on six engines, for both families, with the empty cases and the zero-length path | each template filled once per solution | quadratic for every form that keeps the payload in the template | the same, and Jena applies a quad with no variable once | Source (Jena, Oxigraph) and Observed (six engines) |
 | [TSD-66](#tsd-66-jena-tdb2-and-fuseki-over-it-apply-an-update-as-arq-in-memory-does-roll-back-a-request-whose-second-operation-fails-and-apply-a-request-the-client-abandoned) | TSD-53's order and skip, TSD-06's failing request, a blank node in a template, and an abandoned request, on TDB2 and Fuseki | all deletions then all insertions, the quad skipped, a request should be atomic, a blank node minted per solution | not applicable | not applicable | Source and Observed (Jena 5.1.0, TDB2 on disk, Fuseki main over HTTP) |
 | [TSD-67](#tsd-67-rdf4j-610s-memorystore-applies-a-deleteinsert-one-solution-at-a-time-writes-a-template-quad-whose-graph-is-unbound-and-rolls-back-a-request-whose-second-operation-fails) | TSD-01, TSD-05 and TSD-06 on RDF4J, and a generated composite replace | as those, and the replace should leave only the payload | not applicable | not applicable | Observed (RDF4J 6.1.0 MemoryStore): ✘ per solution, ✘ the quad written, rolls back. ✘ the composite replace leaves the old members and the old head (addendum) |
+| [TSD-71](#tsd-71-an-optional-join-and-a-union-that-stands-for-it-cost-differently-on-each-engine) | an `OPTIONAL` join against a `UNION` standing for it, in a summed read | not specified | `OPTIONAL` 1.2 times the plain sum, `UNION` 6.0 | `OPTIONAL` 4.1, `UNION` 1.7 (0.5.13) | Observed |
+| [TSD-72](#tsd-72-a-running-balance-clamped-at-a-ceiling-is-not-one-sparql-query-and-the-ordered-read-that-replaces-it) | a running balance clamped at a ceiling | not expressible in SPARQL 1.1 | an ordered read folded by the caller, 1.2 to 1.6 times the sum | the same, 1.9 to 2.0 times (0.5.13) | Reasoned, Observed |
 
 ## 6. The findings
 
@@ -1736,6 +1738,47 @@ So `"1/3"` and `"2/6"` are different terms and never equal values, and an order 
 
 To see it, load the three triples `<urn:a> <urn:p> "1/3"^^<http://www.w3.org/2002/07/owl#rational>` (and `"2/6"`, `"1/2"`) into each store and run the two filters.
 
+### TSD-71. An `OPTIONAL` join and a `UNION` that stands for it cost differently on each engine
+
+**Evidence:** Observed on rdflib 7.6.0, Oxigraph 0.5.13 and Jena ARQ 5.1.0 in memory, 2026-11-11, Python 3.14.7 on an arm64 laptop, by a benchmark of a ledger's balance reads. No query plan was read, so the mechanism is not known (TSD-Q37).
+
+**Context.** An account's balance is a sum over its postings in a set of named graphs, and a credit counts only if its kind is one the account accepts. The kind is an optional property of a posting, absent on a debit. A read joins to it either by `OPTIONAL` or by a `UNION` of the rows that need no kind and the rows that have one.
+
+**How we found it.** The first full run used `OPTIONAL` on every engine. The kind-filtered read cost 4 times the plain sum on Oxigraph and about 1.2 times on the others. A run with the `UNION` form on every engine reversed it on rdflib. Each engine then read with its cheaper form, and both forced runs were kept for comparison.
+
+**What the store does.** Inside `{ VALUES ?g { … } GRAPH ?g { ?p :position ?pos ; :direction ?d ; :amount ?a . FILTER(?pos <= N) JOIN } }`, summed with `SUM`, where JOIN is one of the two forms. Factor of the 27 reads against the same sum without the join, 20,000 postings, 30% credits:
+
+| JOIN | rdflib | Oxigraph | Jena ARQ |
+|---|---|---|---|
+| `OPTIONAL { ?p :kind ?k }` | 1.2 | 4.1 | 1.4 |
+| `{ ?p :direction :Debit } UNION { ?p :kind ?k }` | 6.0 | 1.7 | 1.6 |
+
+A single read of one subtree on Oxigraph, outside the committed run, took about 24 ms for the sum, 199 ms with `OPTIONAL` and 33 ms with `UNION`.
+
+**The two forms are not equivalent.** The `UNION` above drops a posting that is neither a debit nor has a kind, a credit with no kind, where `OPTIONAL` keeps it with `?k` unbound. The figures were measured on data in which every credit has a kind, so they compare like with like there, and a form that keeps such a credit, for example a third branch `{ ?p :direction :Credit . FILTER NOT EXISTS { ?p :kind ?z } }`, is being measured.
+
+**What it means for a project.** The cheaper form of an optional join is a property of the engine, so a generated read that must run on several engines either chooses its form per engine or accepts a factor of 4 to 6 on one of them. Check that a `UNION` written for an `OPTIONAL` keeps every row the `OPTIONAL` keeps.
+
+**Reproduce it.** `mise run check:ledger-credit-kinds` in LATTICE, with `LEDGER_KINDS_FORM=optional` or `union` to force one form on every engine.
+
+### TSD-72. A running balance clamped at a ceiling is not one SPARQL query, and the ordered read that replaces it
+
+**Evidence:** Reasoned from SPARQL 1.1, which has no window functions and whose aggregates are defined over a multiset with no order, and Observed for the cost on rdflib 7.6.0, Oxigraph 0.5.13 and Jena ARQ 5.1.0 in memory, 2026-11-11, by the benchmark of TSD-71.
+
+**Context.** A credit never lifts an account above its stated amount, so where a ceiling can bind, an account's balance is a running balance applied in order with each credit clamped, and not a sum.
+
+**What the store does.** No SPARQL 1.1 query computes it. A sum ignores order, and a clamp applied to the sum differs from a clamp applied at each step whenever a credit is clamped and a later debit follows. The form that works on every engine is `SELECT ?pos ?mp ?d ?a WHERE { … } ORDER BY ?pos ?mp`, folded by the caller. Its cost against the plain `SUM` of the same rows, 30% credits, for 1,000, 5,000 and 20,000 postings:
+
+| | rdflib | Oxigraph | Jena ARQ, through a JSON pipe to Python |
+|---|---|---|---|
+| ordered read and fold | 1.56, 1.57, 1.21 | 1.90, 1.97, 1.95 | 3.43, 4.49, 4.89 |
+
+The Jena figure includes every row crossing a pipe between processes, which a caller in the JVM would not pay, so it is an upper bound until a native run is recorded.
+
+**What it means for a project.** A read that must apply a ceiling step by step moves every row it folds out of the store. On rdflib and Oxigraph that costs about what a filtered aggregate costs. A checkpoint bounds the rows the same way it bounds a sum.
+
+**Reproduce it.** As TSD-71.
+
 ## 7. Corrections, and what they taught us
 
 ### 7.1 rdflib and the order of an update (TSD-01)
@@ -1810,3 +1853,4 @@ What we take from it. A probe stands in for a generated query only if it has the
 | TSD-Q32 | whether to file the unfiled upstream reports, in what order, and whether RDFLib/rdflib#3498 covers the grouped query over no rows with a constant projection | a report is a person's to make | Updated 2026-10-27: oxigraph/oxigraph#2008 and oxigraph/oxigraph#2009 are filed. check #3498 against a reproduction of the grouped query over no rows first |  |
 | TSD-Q35 | whether the two rdflib departures drafted (TSD-60, TSD-61) are filed upstream, and whether a release after 7.6.0 fixes them | both are written up with a failing test and not filed | Searched 2026-10-27 (R-Y): `repo:RDFLib/rdflib SUM IF aggregate SPARQLTypeError` and `SPARQL comparison string number type error` gave 0 results each, so no report exists that we found. file them with their smallest query, and re-run the probes on each rdflib release. The probes of TSD-60 and TSD-61 fail when one is fixed |  |
 | TSD-Q36 | why RDF4J 6.1.0 fills an update's templates with every variable unbound when its `WHERE` holds a path with `?` or `*`, and whether `+`, a later release or an upstream report bears on it | every generated composite operation is wrong on RDF4J (TSD-67's addendum). Isolated 2026-11-01 to the path, with `OPTIONAL` and the transaction ruled out | read `SailUpdateExecutor` and the path evaluation at the tag `6.1.0`, probe `+` and the smallest update that fails, search the upstream tracker, and rerun the JVM benchmark on a later RDF4J |  |
+| TSD-Q37 | why an `OPTIONAL` join to a property inside `GRAPH ?g` with `?g` from `VALUES` costs four times a plain read on Oxigraph and a `UNION` six times on rdflib (TSD-71) | a generated read must choose its form per engine until the cause is known | read each engine's plan for the two forms |  |
