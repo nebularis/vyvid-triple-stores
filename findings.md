@@ -1785,6 +1785,80 @@ The Jena figure includes every row crossing a pipe between processes, which a ca
 
 **Reproduce it.** As TSD-71.
 
+### TSD-73. Oxigraph on disk does not make concurrent updates wait for each other, so a guarded update loses writes, and Oxigraph in memory does
+
+**Evidence:** Observed on pyoxigraph 0.5.13 with Python 3.14.7 on an 8-core arm64 laptop running macOS, 2026-11-12, by two independent probes. Source, from Oxigraph's files at the tag `v0.5.13`, read through a fetch of each file and not line by line. Documented for what the store promises. Not measured: Oxigraph's server over HTTP, any other version, and any other store.
+
+**Context.** A ledger's writer reads the balances on a posting's path and then writes the posting. Two writers that both read and then both write can each act on a stale balance. The guard that closes the race is one revision triple moved by a `DELETE`/`INSERT`/`WHERE` on its expected value, so a stale writer matches nothing and writes nothing. The guard only works if the store either applies update requests one at a time or refuses the second of two that rewrite the same statement. We needed to know whether Oxigraph does.
+
+**How we found it.**
+
+1. *A benchmark's stress.* Threads in one process shared one `pyoxigraph.Store`, and each wrote postings through the guard, confirming a write by asking for its own posting. On the in-memory store 9 of 9 runs (2, 4 and 8 threads, 3 runs each, 1,000 requests) left one commit at each revision. On the on-disk store 8 of 9 left two commits at some revision, 2 to 32 of them a run, and both writers' confirmations succeeded.
+2. *A minimal probe, written apart from the benchmark.* A counter triple and nothing else. Each thread reads the counter `N`, sends the guarded update below with its own marker, and asks whether its marker exists. It stops at 1,000. A second form increments in the store, with no read by the caller.
+3. *The same probe with one lock.* A `threading.Lock` held around `Store.update` alone, with the reads and the confirmation outside it.
+4. *Source.* `lib/oxigraph/src/storage/memory.rs`, `start_transaction`, takes `self.transaction_lock.lock()` and keeps the guard in the transaction until it commits or is dropped, under the comment "We ensure there is only one transaction running". `lib/oxigraph/src/storage/rocksdb_wrapper.rs` opens a plain RocksDB with `rocksdb_open_column_families`, never an optimistic or pessimistic transaction database. Its `start_readable_transaction` takes `rocksdb_create_snapshot` and an indexed write batch, and its `commit` calls `rocksdb_write_writebatch_wi` with no lock, no sequence check and no retry.
+5. *Documentation.* The `Store` documentation for 0.5.13 promises the "repeatable read" isolation level and atomic transactions. It says nothing about two writers.
+
+**What the store does.**
+
+```sparql
+# stored beforehand: <urn:c> <urn:v> 0 . A writer that read N sends, with its own marker <urn:w:t:i>:
+DELETE { <urn:c> <urn:v> N }
+INSERT { <urn:c> <urn:v> N+1 . <urn:w:t:i> <urn:at> N+1 }
+WHERE  { <urn:c> <urn:v> N }
+```
+
+Markers confirmed, where 1,000 is correct, 3 runs a cell.
+
+| Threads | In memory | On disk | On disk, a lock around `update` |
+|---|---|---|---|
+| 1 | 1,000 | 1,000 | not run |
+| 2 | 1,000, 1,000, 1,000 | 1,576, 1,607, 1,539 | 1,000, 1,000, 1,000 |
+| 4 | 1,000, 1,000, 1,000 | 1,611, 1,549, 1,542 | 1,000, 1,000, 1,000 |
+| 8 | 1,000, 1,000, 1,000 | 1,368, 1,597, 1,308 | 1,000, 1,000, 1,000 |
+
+On disk 270 to 607 revisions a run carried more than one marker. The counter itself ended at 1,000 as one triple, so nothing in the final state shows the loss except the markers.
+
+```sparql
+# the increment in the store, 500 times from each thread
+DELETE { <urn:k> <urn:v> ?n } INSERT { <urn:k> <urn:v> ?m } WHERE { <urn:k> <urn:v> ?n . BIND(?n + 1 AS ?m) }
+```
+
+In memory the counter ended at threads times 500 as one triple, in every run. On disk it ended near 500 whatever the number of threads, and as several triples at once, from 1 to 60 of them, for example 502 and 503 together after two threads.
+
+**Why.** In memory a write transaction holds a lock from its start to its commit, so a second update waits and evaluates its `WHERE` on the committed result of the first. On disk each update evaluates its `WHERE` on a snapshot taken at its start and then writes its batch. Nothing makes a second update wait and nothing compares its snapshot with what was committed since, so two updates that read the same revision both write. Each write is atomic and each read is repeatable, which is what the documentation promises. A lost update is outside that promise.
+
+**What it means for a project.** A guard on an expected value, a counter in the store, and any check-then-write in one request are safe on Oxigraph in memory and unsafe on Oxigraph on disk, unless the caller sends updates one at a time. One lock around the update call restores the guard, and reads need not take it. A caller who treats Oxigraph as a store that serialises its writers is right for the memory store and wrong for the on-disk one at this version. The confirmation step of an optimistic write does not detect the loss, since both writers find their own write. Whether the server behaves the same over HTTP is not measured, and its update handler calls the same `Store`, so treat it as unsafe until probed. This answers the isolation half of TSD-Q4 for Oxigraph. TSD-62 answers it for Fuseki on TDB2 by timing.
+
+**Reproduce it.**
+
+```python
+import collections, tempfile, threading
+import pyoxigraph as ox
+
+def run(store, threads, target=1000):
+    store.update("INSERT DATA { <urn:c> <urn:v> 0 }")
+    def work(t):
+        i = 0
+        while True:
+            n = int(next(iter(store.query("SELECT ?n WHERE { <urn:c> <urn:v> ?n }")))[0].value)
+            if n >= target:
+                return
+            i += 1
+            store.update(f"DELETE {{ <urn:c> <urn:v> {n} }} INSERT {{ <urn:c> <urn:v> {n + 1} . <urn:w:{t}:{i}> <urn:at> {n + 1} }} WHERE {{ <urn:c> <urn:v> {n} }}")
+    pool = [threading.Thread(target=work, args=(t,)) for t in range(threads)]
+    [t.start() for t in pool]
+    [t.join() for t in pool]
+    per = collections.Counter(r[0].value for r in store.query("SELECT ?x WHERE { ?w <urn:at> ?x }"))
+    return sum(per.values()), sum(c > 1 for c in per.values())  # markers, revisions with more than one
+
+print("memory", run(ox.Store(), 4))
+with tempfile.TemporaryDirectory() as d:
+    print("disk", run(ox.Store(d), 4))
+```
+
+A correct store prints 1,000 markers and 0 revisions with more than one. The result on disk varies from run to run, so a test of it asserts the memory store and reports the disk store.
+
 ## 7. Corrections, and what they taught us
 
 ### 7.1 rdflib and the order of an update (TSD-01)
@@ -1837,7 +1911,7 @@ What we take from it. A probe stands in for a generated query only if it has the
 | TSD-Q1 | does rdflib order a lazy join's solutions deterministically | only non-lazy joins go through a `set`, so some updates may have a fixed order | read `evalLazyJoin` and probe a lazy form |  |
 | TSD-Q2 | what Oxigraph does with initial bindings, if `pyoxigraph` offers them for updates | TSD-12 holds for rdflib only | probe it |  |
 | TSD-Q3 | whether the specification's zero-length path includes a constant endpoint in no triple | TSD-08 names one store as right without checking the text. Five engines of six include it (TSD-51's addendum, 2026-11-01), Oxigraph 0.5.13 alone does not | re-read SPARQL 1.1 §18.4 |  |
-| TSD-Q4 | the isolation half of request atomicity, and whether inserting an identical statement conflicts | a model of each store's concurrency branches on both | probe with concurrent writers |  |
+| TSD-Q4 | the isolation half of request atomicity, and whether inserting an identical statement conflicts | a model of each store's concurrency branches on both | Answered in part. TSD-73 gives the isolation half for Oxigraph 0.5.13, in memory and on disk, and TSD-62 for Fuseki on TDB2. Still to probe with concurrent writers: Oxigraph's server, Jena in memory and TDB2 called in process, rdflib and RDF4J, and whether inserting an identical statement conflicts anywhere |  |
 | TSD-Q5 | why Oxigraph turns `xsd:long` into `xsd:integer` | TSD-07 is observed, not explained | read Oxigraph's literal encoding |  |
 | TSD-Q11 | whether Oxigraph groups a chain of same-precedence operators from the right in a later version, and why in 0.5.11 | TSD-17 is observed, not explained, and a renderer works around it | read the parser, try the newer releases, and report it upstream if it still holds |  |
 | TSD-Q12 | whether Fuseki shows TSD-15 to TSD-18 | they are measured on three in-process stores, and Fuseki adds an HTTP layer and perhaps a different dataset implementation | Narrowed 2026-10-27 (R-X): in-process Jena ARQ 5.1.0 shows none of them departing (TSD-15, TSD-16 in TSD-56, TSD-17 and TSD-18 in TSD-52). run the same probes against Fuseki through its endpoint |  |
