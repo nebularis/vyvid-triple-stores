@@ -223,6 +223,8 @@ The two are not interchangeable. Some functions accept only a variable (`BOUND`)
 | [TSD-67](#tsd-67-rdf4j-610s-memorystore-applies-a-deleteinsert-one-solution-at-a-time-writes-a-template-quad-whose-graph-is-unbound-and-rolls-back-a-request-whose-second-operation-fails) | TSD-01, TSD-05 and TSD-06 on RDF4J, and a generated composite replace | as those, and the replace should leave only the payload | not applicable | not applicable | Observed (RDF4J 6.1.0 MemoryStore): ✘ per solution, ✘ the quad written, rolls back. ✘ the composite replace leaves the old members and the old head (addendum) |
 | [TSD-71](#tsd-71-an-optional-join-and-a-union-that-stands-for-it-cost-differently-on-each-engine) | an `OPTIONAL` join against a `UNION` standing for it, in a summed read | not specified | `OPTIONAL` 1.2 times the plain sum, `UNION` 6.0 | `OPTIONAL` 4.1, `UNION` 1.7 (0.5.13) | Observed |
 | [TSD-72](#tsd-72-a-running-balance-clamped-at-a-ceiling-is-not-one-sparql-query-and-the-ordered-read-that-replaces-it) | a running balance clamped at a ceiling | not expressible in SPARQL 1.1 | an ordered read folded by the caller, 1.2 to 1.6 times the sum | the same, 1.9 to 2.0 times (0.5.13). Jena from Java, 1.7 to 2.6 | Reasoned, Observed |
+| [TSD-73](#tsd-73-oxigraph-on-disk-does-not-make-concurrent-updates-wait-for-each-other-so-a-guarded-update-loses-writes-and-oxigraph-in-memory-does) | two concurrent `DELETE`/`INSERT`/`WHERE` updates guarded on one expected value | not specified | not tested | in memory ✔ the second waits and writes nothing. **On disk ✘ both commit** (0.5.13) | Observed, Source |
+| [TSD-74](#tsd-74-jena-in-memory-and-tdb2-called-in-process-make-a-second-write-transaction-wait-so-a-guarded-update-holds) | the same two guarded updates on Jena, in memory and on TDB2, called in process | not specified | not applicable | not applicable. Jena 5.1.0: ✔ the second waits and writes nothing, on both | Observed, Documented |
 
 ## 6. The findings
 
@@ -1859,6 +1861,94 @@ with tempfile.TemporaryDirectory() as d:
 
 A correct store prints 1,000 markers and 0 revisions with more than one. The result on disk varies from run to run, so a test of it asserts the memory store and reports the disk store.
 
+### TSD-74. Jena in memory and TDB2, called in process, make a second write transaction wait, so a guarded update holds
+
+**Evidence:** Observed on Apache Jena 5.1.0 called from Java 25 on an 8-core arm64 laptop running macOS, 2026-11-12, by a benchmark's probe and by a second probe written apart from it. Documented, since Jena describes a dataset's transactions as multiple readers and a single writer. The class members that hold the writer lock were listed from the 5.1.0 jars with `javap`, and the source was not read. Not measured: a guarded update sent to Fuseki over HTTP (TSD-62 has Fuseki by timing), several processes on one TDB2 directory, and any other version.
+
+**Context.** TSD-73 found that Oxigraph on disk loses guarded writes. The same guard, one revision triple moved by a `DELETE`/`INSERT`/`WHERE` on its expected value, had to be probed on Jena before a design rested on it there.
+
+**How we found it.**
+
+1. *The probe of TSD-73, in Java.* Threads in one JVM share one dataset, `DatasetFactory.createTxnMem()` or `TDB2Factory.connectDataset` on a temporary directory. Each thread reads the counter `N` in a read transaction, sends the guarded update with its own marker in a write transaction of its own (`Txn.executeWrite`), and asks in a read transaction whether its marker exists. It stops at 1,000 in memory and at 100 on TDB2, where every commit is made durable (TSD-44). 1, 2, 4 and 8 threads, three runs a cell at two threads or more.
+2. *The increment in the store,* with no read by the caller, 500 times a thread in memory and 50 on TDB2.
+3. *A ledger writer through the same guard.* 1,000 requests in memory and 200 on TDB2 from 1, 2, 4 and 8 threads, each store then exported and replayed in commit order. Every guarded run, 10 in memory and 10 on TDB2, held one commit at each revision and equalled its replay. The same writer with no guard left 484 to 776 revisions of 1,000 with two commits in memory and 100 to 175 of 200 on TDB2, and raised no error.
+4. *A second probe, written apart from the benchmark,* the program under Reproduce it, run three times. All 9 runs in memory confirmed 1,000 markers of 1,000 and all 9 on TDB2 confirmed 60 of 60, with no revision carrying more than one.
+5. *The jars.* `javap -p` on `org.apache.jena.dboe.transaction.txn.TransactionCoordinator` (jena-dboe-transaction 5.1.0, which TDB2 uses) lists a `java.util.concurrent.Semaphore writersWaiting` with `acquireWriterLock(boolean)` and `releaseWriterLock()`. On `org.apache.jena.sparql.core.mem.DatasetGraphInMemory` (jena-arq 5.1.0) it lists a `transactionLock` and a `systemLock` beside `_begin(TxnType, ReadWrite)`.
+
+**What the store does.**
+
+```sparql
+# stored beforehand: <urn:c> <urn:v> 0 . A writer that read N sends, with its own marker <urn:w:t:i>:
+DELETE { <urn:c> <urn:v> N }
+INSERT { <urn:c> <urn:v> N+1 . <urn:w:t:i> <urn:at> N+1 }
+WHERE  { <urn:c> <urn:v> N }
+```
+
+Markers confirmed in the benchmark's probe, 3 runs a cell, where the target is correct, and the updates that found the counter already moved and wrote nothing.
+
+| Threads | In memory, target 1,000 | lost races | TDB2, target 100 | lost races |
+|---|---|---|---|---|
+| 1 | 1,000 | 0 | 100 | 0 |
+| 2 | 1,000, 1,000, 1,000 | 997, 999, 998 | 100, 100, 100 | 100, 100, 100 |
+| 4 | 1,000, 1,000, 1,000 | 2,904, 2,979, 2,958 | 100, 100, 100 | 300, 300, 300 |
+| 8 | 1,000, 1,000, 1,000 | 6,778, 6,574, 6,850 | 100, 100, 100 | 700, 700, 700 |
+
+No revision carried more than one marker in any of the 20 runs, and the counter ended as one triple. The increment in the store ended at threads times the count as one triple in every run, for example 4,000 after eight threads of 500 in memory. The second probe lost 60, 180 and 420 races on TDB2 at 2, 4 and 8 threads in each of its three runs, and 987 to 993, 2,515 to 2,729 and 2,022 to 2,838 in memory.
+
+**Why.** A Jena dataset admits one write transaction at a time. A second one waits at its start until the first has committed, so an update evaluates its `WHERE` on the first's result, and a stale guard matches nothing. This is Jena's documented transaction model, and the members listed in step 5 are where each dataset holds the lock. TDB2 loses exactly threads less one races a revision in both probes, which is what writers queued in arrival order behind one lock give, since every thread that read `N` sends its update and one of them wins. We did not read the source, so the fairness of the queue is inferred from that count.
+
+**What it means for a project.** A guard on an expected value, a counter in the store, and a check-then-write in one request are safe on Jena in memory and on TDB2 called in process, as they are on Oxigraph in memory and are not on Oxigraph on disk (TSD-73). Two writes of the same statement do not conflict on Jena, since they never run at once, so a writer with no guard overwrites silently and nothing is raised. On TDB2 a commit costs 84 to 98 ms here, as TSD-44 found through Fuseki, so a guarded writer commits about ten times a second whatever the number of threads, and more threads only add lost races. A caller in process could instead hold one write transaction across its reads and its write, which needs no guard and no retry and is not available to a caller that speaks the SPARQL protocol. We did not measure that form. This answers the isolation half of TSD-Q4 for Jena in memory and TDB2 in process, and the identical-statement half for Jena.
+
+**Reproduce it.** With Jena 5.1.0 (`jena-tdb2` and its dependencies) on the class path, run this as a single source file.
+
+```java
+import java.nio.file.Files;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.apache.jena.query.*;
+import org.apache.jena.system.Txn;
+import org.apache.jena.tdb2.TDB2Factory;
+import org.apache.jena.update.UpdateExecution;
+
+public class Probe {
+    static long one(Dataset ds, String q, String v) {
+        return Txn.calculateRead(ds, () -> { try (QueryExecution qe = QueryExecution.dataset(ds).query(q).build()) { return qe.execSelect().next().getLiteral(v).getLong(); } });
+    }
+    static void update(Dataset ds, String u) { Txn.executeWrite(ds, () -> UpdateExecution.dataset(ds).update(u).execute()); }
+
+    static void run(String name, Dataset ds, int threads, int target) throws Exception {
+        update(ds, "INSERT DATA { <urn:c> <urn:v> 0 }");
+        AtomicInteger lost = new AtomicInteger();
+        Thread[] pool = new Thread[threads];
+        for (int t = 0; t < threads; t++) {
+            int id = t;
+            pool[t] = new Thread(() -> {
+                for (int i = 0; ; i++) {
+                    long n = one(ds, "SELECT ?n WHERE { <urn:c> <urn:v> ?n }", "n");
+                    if (n >= target) return;
+                    String m = "<urn:w:" + id + ":" + i + ">";
+                    update(ds, "DELETE { <urn:c> <urn:v> " + n + " } INSERT { <urn:c> <urn:v> " + (n + 1) + " . " + m + " <urn:at> " + (n + 1) + " } WHERE { <urn:c> <urn:v> " + n + " }");
+                    if (one(ds, "SELECT (COUNT(*) AS ?c) WHERE { " + m + " <urn:at> ?x }", "c") == 0) lost.incrementAndGet();
+                }
+            });
+            pool[t].start();
+        }
+        for (Thread th : pool) th.join();
+        System.out.println(name + " threads " + threads + " markers " + one(ds, "SELECT (COUNT(?m) AS ?c) WHERE { ?m <urn:at> ?x }", "c") + " of " + target + ", revisions with more than one "
+                + one(ds, "SELECT (COUNT(*) AS ?c) WHERE { SELECT ?x WHERE { ?m <urn:at> ?x } GROUP BY ?x HAVING (COUNT(?m) > 1) }", "c") + ", lost races " + lost.get());
+        ds.close();
+    }
+
+    public static void main(String[] args) throws Exception {
+        for (int threads : new int[] {2, 4, 8}) {
+            run("memory", DatasetFactory.createTxnMem(), threads, 1000);
+            run("tdb2", TDB2Factory.connectDataset(Files.createTempDirectory("probe-tdb2-").toString()), threads, 60);
+        }
+    }
+}
+```
+
+A store that keeps the guard prints the target as its markers and 0 revisions with more than one. A test of it asserts both.
+
 ## 7. Corrections, and what they taught us
 
 ### 7.1 rdflib and the order of an update (TSD-01)
@@ -1911,7 +2001,7 @@ What we take from it. A probe stands in for a generated query only if it has the
 | TSD-Q1 | does rdflib order a lazy join's solutions deterministically | only non-lazy joins go through a `set`, so some updates may have a fixed order | read `evalLazyJoin` and probe a lazy form |  |
 | TSD-Q2 | what Oxigraph does with initial bindings, if `pyoxigraph` offers them for updates | TSD-12 holds for rdflib only | probe it |  |
 | TSD-Q3 | whether the specification's zero-length path includes a constant endpoint in no triple | TSD-08 names one store as right without checking the text. Five engines of six include it (TSD-51's addendum, 2026-11-01), Oxigraph 0.5.13 alone does not | re-read SPARQL 1.1 §18.4 |  |
-| TSD-Q4 | the isolation half of request atomicity, and whether inserting an identical statement conflicts | a model of each store's concurrency branches on both | Answered in part. TSD-73 gives the isolation half for Oxigraph 0.5.13, in memory and on disk, and TSD-62 for Fuseki on TDB2. Still to probe with concurrent writers: Oxigraph's server, Jena in memory and TDB2 called in process, rdflib and RDF4J, and whether inserting an identical statement conflicts anywhere |  |
+| TSD-Q4 | the isolation half of request atomicity, and whether inserting an identical statement conflicts | a model of each store's concurrency branches on both | Answered in part. TSD-73 gives the isolation half for Oxigraph 0.5.13, in memory and on disk, TSD-74 for Jena 5.1.0 in memory and on TDB2 called in process, and TSD-62 for Fuseki on TDB2. TSD-74 also finds that two writes of an identical statement do not conflict on Jena. Still to probe with concurrent writers: Oxigraph's server, rdflib and RDF4J, and whether inserting an identical statement conflicts on a store other than Jena |  |
 | TSD-Q5 | why Oxigraph turns `xsd:long` into `xsd:integer` | TSD-07 is observed, not explained | read Oxigraph's literal encoding |  |
 | TSD-Q11 | whether Oxigraph groups a chain of same-precedence operators from the right in a later version, and why in 0.5.11 | TSD-17 is observed, not explained, and a renderer works around it | read the parser, try the newer releases, and report it upstream if it still holds |  |
 | TSD-Q12 | whether Fuseki shows TSD-15 to TSD-18 | they are measured on three in-process stores, and Fuseki adds an HTTP layer and perhaps a different dataset implementation | Narrowed 2026-10-27 (R-X): in-process Jena ARQ 5.1.0 shows none of them departing (TSD-15, TSD-16 in TSD-56, TSD-17 and TSD-18 in TSD-52). run the same probes against Fuseki through its endpoint |  |
