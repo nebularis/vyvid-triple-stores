@@ -225,6 +225,7 @@ The two are not interchangeable. Some functions accept only a variable (`BOUND`)
 | [TSD-72](#tsd-72-a-running-balance-clamped-at-a-ceiling-is-not-one-sparql-query-and-the-ordered-read-that-replaces-it) | a running balance clamped at a ceiling | not expressible in SPARQL 1.1 | an ordered read folded by the caller, 1.2 to 1.6 times the sum | the same, 1.9 to 2.0 times (0.5.13). Jena from Java, 1.7 to 2.6 | Reasoned, Observed |
 | [TSD-73](#tsd-73-oxigraph-on-disk-does-not-make-concurrent-updates-wait-for-each-other-so-a-guarded-update-loses-writes-and-oxigraph-in-memory-does) | two concurrent `DELETE`/`INSERT`/`WHERE` updates guarded on one expected value | not specified | not tested | in memory ✔ the second waits and writes nothing. **On disk ✘ both commit** (0.5.13) | Observed, Source |
 | [TSD-74](#tsd-74-jena-in-memory-and-tdb2-called-in-process-make-a-second-write-transaction-wait-so-a-guarded-update-holds) | the same two guarded updates on Jena, in memory and on TDB2, called in process | not specified | not applicable | not applicable. Jena 5.1.0: ✔ the second waits and writes nothing, on both | Observed, Documented |
+| [TSD-75](#tsd-75-on-rdflib-a-pattern-inside-a-named-graph-scans-the-whole-store-for-its-predicate-so-a-read-over-many-graphs-costs-graphs-times-rows) | a sum over rows held in many named graphs, listed by `VALUES ?g` | not specified | the time follows the number of graphs with the rows fixed, and each graph costs in proportion to the rows of the whole store | flat in the number of graphs (0.5.13) | Source, Observed |
 
 ## 6. The findings
 
@@ -1950,6 +1951,99 @@ public class Probe {
 ```
 
 A store that keeps the guard prints the target as its markers and 0 revisions with more than one. A test of it asserts both.
+
+### TSD-75. On rdflib a pattern inside a named graph scans the whole store for its predicate, so a read over many graphs costs graphs times rows
+
+**Evidence:** Source, read from rdflib 7.6.0, `rdflib/plugins/stores/memory.py`, `Memory.triples`. Observed twice. By a probe of a benchmark of a ledger's balance reads on rdflib 7.6.0 and Oxigraph 0.5.13 through `pyoxigraph`, 2026-11-16, Python 3.14.10 on a 4-core x86_64 Linux machine, five reads a cell after one warm-up. And by a program written apart from it, under Reproduce it, on the same versions, 2026-11-16, Python 3.14.7 on an arm64 laptop running macOS, three reads a cell after one warm-up. Not measured: Jena, a store other than rdflib's `Memory`, and a pattern with a bound subject or object.
+
+**Context.** A ledger's postings sat in named graphs, one for each group of accounts and period, and a balance was a sum over every graph a read covers, listed by `VALUES ?g`. After a change to the generated data the same number of rows sat in 1.59 times as many graphs. The read then took 1.55 times as long on rdflib and did not move on Oxigraph or Jena. We needed to know whether rdflib's cost was the rows or the graphs, since a partition is chosen to bound a read.
+
+**How we found it.**
+
+1. *The partition varied with the rows fixed.* The same 20,000 postings were stored with a period of 100, 200, 320 and 640 passes, which puts them in 969, 486, 306 and 156 named graphs, and the sum over all of them was read on rdflib and on Oxigraph. The rows folded are 20,000 in every cell.
+2. *A program written apart from the benchmark,* with 6,000 and then 12,000 rows of four triples each in 30, 120 and 480 graphs, to see whether the cost of a graph is fixed or follows the rows.
+3. *The source.* `Memory.triples` takes a pattern and a context. Only a pattern with nothing bound uses the index of a context's own triples. With the predicate bound and the subject and object unbound it walks `pos[predicate]`, every triple of that predicate in the whole store, and keeps a triple where `__triple_has_context` finds the context asked for.
+
+**What the store does.**
+
+```sparql
+SELECT (SUM(?signed) AS ?sum) (COUNT(?p) AS ?n) WHERE {
+  VALUES ?g { <urn:g:0> <urn:g:1> <urn:g:2> }     # every graph the read covers
+  GRAPH ?g { ?p :position ?pos ; :micro ?mp ; :direction ?d ; :amount ?a . FILTER(?pos <= 20000) }
+  BIND(IF(?d = :Debit, -?a, ?a) AS ?signed)
+}
+```
+
+The benchmark's probe, 20,000 rows folded in every cell, median of five reads in ms:
+
+| Named graphs | rdflib | ms a graph | Oxigraph |
+|---|---|---|---|
+| 156 | 12,159 | 78 | 245 |
+| 306 | 20,708 | 68 | 214 |
+| 486 | 32,059 | 66 | 229 |
+| 969 | 59,000 | 61 | 343 |
+
+A line through the four rdflib cells is 58 ms a graph and 0.16 ms a row, and it gives each cell to within 3%.
+
+The second program, median of three reads in ms:
+
+| Rows | Named graphs | rdflib | Oxigraph |
+|---|---|---|---|
+| 6,000 | 30 | 529 | 8.5 |
+| 6,000 | 120 | 842 | 8.1 |
+| 6,000 | 480 | 2,077 | 8.3 |
+| 12,000 | 30 | 1,149 | 15.6 |
+| 12,000 | 120 | 1,993 | 15.9 |
+| 12,000 | 480 | 4,981 | 16.3 |
+
+The cost of one more graph is 3.4 ms at 6,000 rows and 8.5 ms at 12,000, so it grows with the rows of the whole store, a little faster than in proportion here. Oxigraph follows the rows and not the graphs.
+
+**Why.** rdflib evaluates the `GRAPH ?g` block once for each graph in the `VALUES` list. For the first triple pattern, whose predicate alone is bound, the memory store walks every triple of that predicate in every graph and tests each for membership of the graph asked for, as step 3 reads. So one graph costs the predicate's triples in the whole store, and a read over `G` graphs of a store holding `R` such rows costs about `G` times `R`, where an engine with an index that leads with the graph costs about `R`. The patterns after the first have their subject bound and are looked up by subject. We did not profile a run, so that the first pattern is where the time goes is read from the source and the two tables, and the small excess over proportion at 12,000 rows is not explained.
+
+**What it means for a project.** On rdflib's memory store a partition into named graphs does not bound a read, and a finer partition makes a read that covers the whole history dearer though it folds the same rows. A read from a checkpoint lists few graphs and pays little. A cost measured on rdflib for a read over named graphs is a hypothesis for any other engine, and the reverse. Where rdflib is the test engine and another store is the production one, choose the partition on the production store.
+
+**Reproduce it.** With `rdflib` and `pyoxigraph` installed, run this with a row count.
+
+```python
+import statistics, sys, time
+import rdflib, pyoxigraph as ox
+
+N = "urn:x:"
+def rows(n, graphs):
+    lit = lambda v: f'"{v}"^^<http://www.w3.org/2001/XMLSchema#integer>'
+    out = []
+    for i in range(n):
+        g, p = f"<urn:g:{i * graphs // n}>", f"<urn:p:{i}>"
+        d = "Debit" if i % 3 else "Credit"
+        out.append(f"{p} <{N}position> {lit(i + 1)} {g} .\n{p} <{N}micro> {lit(0)} {g} .\n"
+                   f"{p} <{N}direction> <{N}{d}> {g} .\n{p} <{N}amount> {lit(1 + i % 7)} {g} .\n")
+    return "".join(out)
+def query(n, graphs):
+    listed = " ".join(f"<urn:g:{k}>" for k in range(graphs))
+    return (f"SELECT (SUM(?s) AS ?sum) (COUNT(?p) AS ?n) WHERE {{ VALUES ?g {{ {listed} }} GRAPH ?g {{ ?p <{N}position> ?pos ; "
+            f"<{N}micro> ?mp ; <{N}direction> ?d ; <{N}amount> ?a . FILTER(?pos <= {n}) }} BIND(IF(?d = <{N}Debit>, -?a, ?a) AS ?s) }}")
+def timed(run):
+    run()
+    times = []
+    for _ in range(3):
+        start = time.perf_counter()
+        result = run()
+        times.append((time.perf_counter() - start) * 1000)
+    return statistics.median(times), result
+n = int(sys.argv[1]) if len(sys.argv) > 1 else 6000
+for graphs in (30, 120, 480):
+    data, q = rows(n, graphs), query(n, graphs)
+    ds = rdflib.Dataset()
+    ds.parse(data=data, format="nquads")
+    store = ox.Store()
+    store.load(data.encode(), format=ox.RdfFormat.N_QUADS)
+    t_rdflib, a = timed(lambda: [tuple(int(x) for x in row) for row in ds.query(q)])
+    t_oxigraph, b = timed(lambda: [tuple(int(x.value) for x in row) for row in store.query(q)])
+    assert a == b and a[0][1] == n
+    print(f"graphs {graphs} rows {a[0][1]} rdflib {t_rdflib:.0f} ms oxigraph {t_oxigraph:.1f} ms")
+```
+
+A store whose cost follows the graphs prints a time that rises with them at one row count, and a cost for each graph that rises with the row count.
 
 ## 7. Corrections, and what they taught us
 
