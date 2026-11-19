@@ -6,7 +6,7 @@
 
 **Status:** a living record, begun 2026-10-13 from work on generated SPARQL Update operations. Read it before relying on how a store behaves, and add to it when you find something.
 
-**Stores covered:** rdflib 7.6.0 and Oxigraph 0.5.11 (through `pyoxigraph`), Oxigraph 0.5.12 for the findings a test suite probes, of which TSD-01 and TSD-17 changed (R-H), and Oxigraph 0.5.13 for TSD-40, TSD-41 and TSD-43. Apache Jena ARQ 5.1.0 is covered for TSD-15, TSD-16, TSD-25 to TSD-27, TSD-34, TSD-42, TSD-43, TSD-50 to TSD-54, TSD-56, TSD-57, TSD-60 and TSD-61, run in process through a small Java test harness on an in-memory transactional dataset (`DatasetFactory.createTxnMem()`). Jena TDB2 and Fuseki appear in TSD-42, TSD-44, TSD-62, TSD-65 and TSD-66. Each finding names the versions it was seen on. A finding holds for those versions only, until it is checked again. **Tools above a store covered:** pySHACL 0.40.1, which validates shapes on rdflib (TSD-23, TSD-24, TSD-31). TSD-22 to TSD-33 are about the cost of running queries and shapes, and the query rules say which of them are properties of rdflib or pySHACL and which hold anywhere.
+**Stores covered:** rdflib 7.6.0 and Oxigraph 0.5.11 (through `pyoxigraph`), Oxigraph 0.5.12 for the findings a test suite probes, of which TSD-01 and TSD-17 changed (R-H), and Oxigraph 0.5.13 for TSD-40, TSD-41 and TSD-43. Apache Jena ARQ 5.1.0 is covered for TSD-15, TSD-16, TSD-25 to TSD-27, TSD-34, TSD-42, TSD-43, TSD-50 to TSD-54, TSD-56, TSD-57, TSD-60 and TSD-61, run in process through a small Java test harness on an in-memory transactional dataset (`DatasetFactory.createTxnMem()`). Apache Jena ARQ 6.2.0 in memory is covered for TSD-76. Jena TDB2 and Fuseki appear in TSD-42, TSD-44, TSD-62, TSD-65 and TSD-66. Each finding names the versions it was seen on. A finding holds for those versions only, until it is checked again. **Tools above a store covered:** pySHACL 0.40.1, which validates shapes on rdflib (TSD-23, TSD-24, TSD-31). TSD-22 to TSD-33 are about the cost of running queries and shapes, and the query rules say which of them are properties of rdflib or pySHACL and which hold anywhere.
 
 ## Contents
 
@@ -226,6 +226,7 @@ The two are not interchangeable. Some functions accept only a variable (`BOUND`)
 | [TSD-73](#tsd-73-oxigraph-on-disk-does-not-make-concurrent-updates-wait-for-each-other-so-a-guarded-update-loses-writes-and-oxigraph-in-memory-does) | two concurrent `DELETE`/`INSERT`/`WHERE` updates guarded on one expected value | not specified | not tested | in memory ✔ the second waits and writes nothing. **On disk ✘ both commit** (0.5.13) | Observed, Source |
 | [TSD-74](#tsd-74-jena-in-memory-and-tdb2-called-in-process-make-a-second-write-transaction-wait-so-a-guarded-update-holds) | the same two guarded updates on Jena, in memory and on TDB2, called in process | not specified | not applicable | not applicable. Jena 5.1.0: ✔ the second waits and writes nothing, on both | Observed, Documented |
 | [TSD-75](#tsd-75-on-rdflib-a-pattern-inside-a-named-graph-scans-the-whole-store-for-its-predicate-so-a-read-over-many-graphs-costs-graphs-times-rows) | a sum over rows held in many named graphs, listed by `VALUES ?g` | not specified | the time follows the number of graphs with the rows fixed, and each graph costs in proportion to the rows of the whole store | flat in the number of graphs (0.5.13) | Source, Observed |
+| [TSD-76](#tsd-76-jena-overwrites-a-time-set-in-advance-for-now-once-for-each-operation-of-an-update-request) | `NOW()` in an update request of three operations, with a time set in advance in the context | every call in one query execution returns the same value, and an update request is not specified | not probed | not probed. Jena ARQ 6.2.0: ✘ the time set is overwritten, and each operation reads the clock again | Source, Observed |
 
 ## 6. The findings
 
@@ -2044,6 +2045,57 @@ for graphs in (30, 120, 480):
 ```
 
 A store whose cost follows the graphs prints a time that rises with them at one row count, and a cost for each graph that rises with the row count.
+
+### TSD-76. Jena overwrites a time set in advance for `NOW()`, once for each operation of an update request
+
+**Evidence:** Source, read from the Apache Jena ARQ 6.2.0 jar's classes. Observed on ARQ 6.2.0 in memory (`DatasetGraphFactory.createTxnMem()`), called from OpenJDK 25.0.5 on an x86_64 Linux container, 2026-11-19, by a test of three cases run twice. Not measured: TDB2, Fuseki, and any other version.
+
+**Context.** A simulator ran generated updates over a small dataset, to show what a write would do, and each step had to give the same result whenever it ran, at a time the step states. The generated updates read the clock with `NOW()`, for a stored time and for the month in the name of a graph. So we needed to know whether Jena lets a caller say what time `NOW()` returns.
+
+**How we found it.**
+
+1. *A probe.* One request of three `INSERT` operations, each binding `NOW()`, one naming a graph from `SUBSTR(STR(NOW()), 1, 7)`, run three ways with the time `2026-03-31T23:59:58Z` set in advance as `ARQConstants.sysCurrentTime`: on the execution with `UpdateExec.dataset(ds).update(req).set(...)`, on the dataset's context, and on the execution inside a write transaction. In every case each `NOW()` returned the clock, and the graph named was the current month's, not `2026-03`.
+2. *The times.* The three operations of one request recorded three different times, for example `16:35:37.365`, `.422` and `.425`, and so in each of three runs.
+3. *The classes.* `ExprSystem.eval`, which `E_Now` calls, reads `sysCurrentTime` from the context and fails where it is absent or not a node. `Context.setCurrentDateTime` writes it from `NodeFactoryExtra.nowAsDateTime()` without looking for a value already there. `UpdateProcessorBase` and `UpdateProcessorStreamingBase` call it, `UpdateEngineBase.setupContext` sets it again, and `QueryExecDataset.init` and `QueryEngineBase` call it for the `WHERE` of each operation. The parser builds `NOW()` as `E_Now`, not as a function the function registry looks up.
+
+**What the store does.**
+
+```sparql
+INSERT { GRAPH <urn:g:one> { <urn:s> <urn:now> ?t } } WHERE { BIND(NOW() AS ?t) } ;
+INSERT { GRAPH ?g { <urn:s> <urn:now> ?t } } WHERE { BIND(NOW() AS ?t) BIND(IRI(CONCAT("urn:g:log/", SUBSTR(STR(NOW()), 1, 7))) AS ?g) } ;
+INSERT { GRAPH <urn:g:three> { <urn:s> <urn:now> ?t } } WHERE { BIND(NOW() AS ?t) }
+```
+
+Run with `2026-03-31T23:59:58Z` set as the current time on the execution or the dataset: three times read from the clock, each a few milliseconds after the last, and the graph `urn:g:log/` followed by the clock's month.
+
+**Why.** Jena sets the current time in the context itself before each operation's evaluation, overwriting whatever a caller set, so `NOW()` always reads the clock at that operation's start. SPARQL 1.1 Query says every call of `NOW()` in one query execution returns the same value, and the Update recommendation does not say whether the operations of one request share one, so Jena is within the specification.
+
+**What it means for a project.** A time cannot be given to `NOW()` through Jena's context, so an update that reads `NOW()` cannot be replayed at a stated time, and a test of it depends on the clock. The operations of one request read different times, so a request that runs across midnight at a month's end can name two months' graphs, and two stored times of one write can differ. A generated update that must be repeatable takes its time as a parameter. A caller that cannot change the update can replace each `E_Now` in the parsed request with a constant before running it, which changes what runs from the text it was given and should be shown as such.
+
+**Reproduce it.** With Jena ARQ 6.2.0 on the class path, run this as a single source file. A Jena that honours a stated time prints `2026-03` for the month and the stated time three times.
+
+```java
+import org.apache.jena.graph.*;
+import org.apache.jena.sparql.ARQConstants;
+import org.apache.jena.sparql.core.*;
+import org.apache.jena.sparql.exec.UpdateExec;
+import org.apache.jena.sparql.expr.NodeValue;
+import org.apache.jena.update.UpdateFactory;
+
+public class Probe {
+    public static void main(String[] args) {
+        DatasetGraph ds = DatasetGraphFactory.createTxnMem();
+        String req = """
+            INSERT { GRAPH <urn:g:one> { <urn:s> <urn:now> ?t } } WHERE { BIND(NOW() AS ?t) } ;
+            INSERT { GRAPH ?g { <urn:s> <urn:now> ?t } } WHERE { BIND(NOW() AS ?t) BIND(IRI(CONCAT("urn:g:log/", SUBSTR(STR(NOW()), 1, 7))) AS ?g) } ;
+            INSERT { GRAPH <urn:g:three> { <urn:s> <urn:now> ?t } } WHERE { BIND(NOW() AS ?t) }
+            """;
+        Node pin = NodeValue.makeDateTime("2026-03-31T23:59:58Z").asNode();
+        UpdateExec.dataset(ds).update(UpdateFactory.create(req)).set(ARQConstants.sysCurrentTime, pin).build().execute();
+        ds.find(Node.ANY, Node.ANY, NodeFactory.createURI("urn:now"), Node.ANY).forEachRemaining(q -> System.out.println(q.getGraph() + " " + q.getObject().getLiteralLexicalForm()));
+    }
+}
+```
 
 ## 7. Corrections, and what they taught us
 
