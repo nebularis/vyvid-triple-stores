@@ -6,7 +6,7 @@
 
 **Status:** a living record, begun 2026-10-13 from work on generated SPARQL Update operations. Read it before relying on how a store behaves, and add to it when you find something.
 
-**Stores covered:** rdflib 7.6.0 and Oxigraph 0.5.11 (through `pyoxigraph`), Oxigraph 0.5.12 for the findings a test suite probes, of which TSD-01 and TSD-17 changed (R-H), and Oxigraph 0.5.13 for TSD-40, TSD-41 and TSD-43. Apache Jena ARQ 5.1.0 is covered for TSD-15, TSD-16, TSD-25 to TSD-27, TSD-34, TSD-42, TSD-43, TSD-50 to TSD-54, TSD-56, TSD-57, TSD-60 and TSD-61, run in process through a small Java test harness on an in-memory transactional dataset (`DatasetFactory.createTxnMem()`). Apache Jena ARQ 6.2.0 in memory is covered for TSD-76. Oxigraph 0.5.13 and rdflib 7.6.0 are covered for TSD-77 and TSD-78. Jena TDB2 and Fuseki appear in TSD-42, TSD-44, TSD-62, TSD-65 and TSD-66. Each finding names the versions it was seen on. A finding holds for those versions only, until it is checked again. **Tools above a store covered:** pySHACL 0.40.1, which validates shapes on rdflib (TSD-23, TSD-24, TSD-31). TSD-22 to TSD-33 are about the cost of running queries and shapes, and the query rules say which of them are properties of rdflib or pySHACL and which hold anywhere.
+**Stores covered:** rdflib 7.6.0 and Oxigraph 0.5.11 (through `pyoxigraph`), Oxigraph 0.5.12 for the findings a test suite probes, of which TSD-01 and TSD-17 changed (R-H), and Oxigraph 0.5.13 for TSD-40, TSD-41 and TSD-43. Apache Jena ARQ 5.1.0 is covered for TSD-15, TSD-16, TSD-25 to TSD-27, TSD-34, TSD-42, TSD-43, TSD-50 to TSD-54, TSD-56, TSD-57, TSD-60 and TSD-61, run in process through a small Java test harness on an in-memory transactional dataset (`DatasetFactory.createTxnMem()`). Apache Jena ARQ 6.2.0 in memory is covered for TSD-76. Oxigraph 0.5.13 and rdflib 7.6.0 are covered for TSD-77 to TSD-79. Jena TDB2 and Fuseki appear in TSD-42, TSD-44, TSD-62, TSD-65 and TSD-66. Each finding names the versions it was seen on. A finding holds for those versions only, until it is checked again. **Tools above a store covered:** pySHACL 0.40.1, which validates shapes on rdflib (TSD-23, TSD-24, TSD-31). TSD-22 to TSD-33 are about the cost of running queries and shapes, and the query rules say which of them are properties of rdflib or pySHACL and which hold anywhere.
 
 ## Contents
 
@@ -229,6 +229,7 @@ The two are not interchangeable. Some functions accept only a variable (`BOUND`)
 | [TSD-76](#tsd-76-jena-overwrites-a-time-set-in-advance-for-now-once-for-each-operation-of-an-update-request) | `NOW()` in an update request of three operations, with a time set in advance in the context | every call in one query execution returns the same value, and an update request is not specified | not probed | not probed. Jena ARQ 6.2.0: ✘ the time set is overwritten, and each operation reads the clock again | Source, Observed |
 | [TSD-77](#tsd-77-a-decimal-sum-or-product-keeps-its-scale-on-rdflib-and-is-canonical-on-oxigraph) | `29.50 * 12` and `1.10 + 2.20` | the value, its lexical form not stated | `"354.00"`, `"3.30"`, the operands' scale kept | `"354"`, `"3.3"`, canonical (0.5.13) | Observed |
 | [TSD-78](#tsd-78-a-float-or-double-divided-by-zero-is-unbound-on-rdflib-and-infinity-on-oxigraph) | a float or double, and a decimal, divided by zero | `INF` for a float or double, an error for a decimal | ✘ unbound for both | ✔ `INF`, and unbound for a decimal (0.5.13) | Observed, Documented |
+| [TSD-79](#tsd-79-rdflib-evaluates-a-sub-select-with-the-outer-querys-bindings-where-sparql-evaluates-it-on-its-own) | a grouped sub-select that reuses an outer variable it does not project | evaluated on its own, the variable local to it | ✘ the outer bindings fed in | ✔ (0.5.13) | Observed, Documented |
 
 ## 6. The findings
 
@@ -2147,6 +2148,34 @@ SELECT ?v WHERE { BIND(1.0 / 0 AS ?v) }
 **What it means for a project.** A query that divides floats or doubles answers differently on the two engines where the divisor is zero. A project that wants one answer guards the divisor, for example `?n / IF(?d != 0, ?d, ?undefined)`, which leaves the result unbound on both. The departure is rdflib's to report upstream, if anyone does.
 
 **Reproduce it.** As TSD-77, with the two queries above.
+
+### TSD-79. rdflib evaluates a sub-select with the outer query's bindings, where SPARQL evaluates it on its own
+
+**Evidence:** Observed on rdflib 7.6.0 and Oxigraph 0.5.13 through `pyoxigraph`, Python 3.14.10 on an x86_64 Linux container, 2026-11-24, by a compiler's test of a join that keeps an instance only when its value names one match, and by a probe written apart from it. Documented, since SPARQL 1.1 evaluates a sub-select bottom up, so a variable the sub-select does not project is local to it. Source not read.
+
+**Context.** A compiled join kept an instance only where its value named exactly one instance of a second class, with a grouped sub-select counting the matches. As first written, the sub-select reused the outer query's variable names, and on rdflib an instance whose value named two matches was linked to both.
+
+**What the store does.**
+
+```sparql
+# data: <o1> <code> "C1" . <o2> <code> "C2" . <a> <id> "C1" . <b> <id> "C1" . <c> <id> "C2" .
+SELECT ?o ?c WHERE {
+  ?o <urn:code> ?code . ?c <urn:id> ?code .
+  { SELECT ?o WHERE { ?o <urn:code> ?code . ?c <urn:id> ?code } GROUP BY ?o HAVING (COUNT(?c) = 1) }
+}
+```
+
+| Store | Rows |
+|---|---|
+| specification | `(o2, c)` alone, since `o1`'s code names two |
+| rdflib 7.6.0 | `(o1, a)`, `(o1, b)`, `(o2, c)` |
+| Oxigraph 0.5.13 | `(o2, c)` |
+
+**Why.** Not read. rdflib's rows are what a sub-select gives when each outer solution's `?c` and `?code` are fed into it, so each group counts one match. Oxigraph evaluates the sub-select on its own and joins on `?o` alone.
+
+**What it means for a project.** A sub-select that counts or groups gives a different answer on rdflib wherever it reuses the name of an outer variable it does not project. Name a sub-select's own variables apart from the outer query's, which gives the specification's answer on both engines. The departure is rdflib's to report upstream, if anyone does.
+
+**Reproduce it.** With `rdflib` and `pyoxigraph` installed, load the five triples above, with `urn:` IRIs, and run the query on `rdflib.Graph()` and `pyoxigraph.Store()`.
 
 ## 7. Corrections, and what they taught us
 
