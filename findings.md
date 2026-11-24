@@ -6,7 +6,7 @@
 
 **Status:** a living record, begun 2026-10-13 from work on generated SPARQL Update operations. Read it before relying on how a store behaves, and add to it when you find something.
 
-**Stores covered:** rdflib 7.6.0 and Oxigraph 0.5.11 (through `pyoxigraph`), Oxigraph 0.5.12 for the findings a test suite probes, of which TSD-01 and TSD-17 changed (R-H), and Oxigraph 0.5.13 for TSD-40, TSD-41 and TSD-43. Apache Jena ARQ 5.1.0 is covered for TSD-15, TSD-16, TSD-25 to TSD-27, TSD-34, TSD-42, TSD-43, TSD-50 to TSD-54, TSD-56, TSD-57, TSD-60 and TSD-61, run in process through a small Java test harness on an in-memory transactional dataset (`DatasetFactory.createTxnMem()`). Apache Jena ARQ 6.2.0 in memory is covered for TSD-76. Jena TDB2 and Fuseki appear in TSD-42, TSD-44, TSD-62, TSD-65 and TSD-66. Each finding names the versions it was seen on. A finding holds for those versions only, until it is checked again. **Tools above a store covered:** pySHACL 0.40.1, which validates shapes on rdflib (TSD-23, TSD-24, TSD-31). TSD-22 to TSD-33 are about the cost of running queries and shapes, and the query rules say which of them are properties of rdflib or pySHACL and which hold anywhere.
+**Stores covered:** rdflib 7.6.0 and Oxigraph 0.5.11 (through `pyoxigraph`), Oxigraph 0.5.12 for the findings a test suite probes, of which TSD-01 and TSD-17 changed (R-H), and Oxigraph 0.5.13 for TSD-40, TSD-41 and TSD-43. Apache Jena ARQ 5.1.0 is covered for TSD-15, TSD-16, TSD-25 to TSD-27, TSD-34, TSD-42, TSD-43, TSD-50 to TSD-54, TSD-56, TSD-57, TSD-60 and TSD-61, run in process through a small Java test harness on an in-memory transactional dataset (`DatasetFactory.createTxnMem()`). Apache Jena ARQ 6.2.0 in memory is covered for TSD-76. Oxigraph 0.5.13 and rdflib 7.6.0 are covered for TSD-77 and TSD-78. Jena TDB2 and Fuseki appear in TSD-42, TSD-44, TSD-62, TSD-65 and TSD-66. Each finding names the versions it was seen on. A finding holds for those versions only, until it is checked again. **Tools above a store covered:** pySHACL 0.40.1, which validates shapes on rdflib (TSD-23, TSD-24, TSD-31). TSD-22 to TSD-33 are about the cost of running queries and shapes, and the query rules say which of them are properties of rdflib or pySHACL and which hold anywhere.
 
 ## Contents
 
@@ -227,6 +227,8 @@ The two are not interchangeable. Some functions accept only a variable (`BOUND`)
 | [TSD-74](#tsd-74-jena-in-memory-and-tdb2-called-in-process-make-a-second-write-transaction-wait-so-a-guarded-update-holds) | the same two guarded updates on Jena, in memory and on TDB2, called in process | not specified | not applicable | not applicable. Jena 5.1.0: ✔ the second waits and writes nothing, on both | Observed, Documented |
 | [TSD-75](#tsd-75-on-rdflib-a-pattern-inside-a-named-graph-scans-the-whole-store-for-its-predicate-so-a-read-over-many-graphs-costs-graphs-times-rows) | a sum over rows held in many named graphs, listed by `VALUES ?g` | not specified | the time follows the number of graphs with the rows fixed, and each graph costs in proportion to the rows of the whole store | flat in the number of graphs (0.5.13) | Source, Observed |
 | [TSD-76](#tsd-76-jena-overwrites-a-time-set-in-advance-for-now-once-for-each-operation-of-an-update-request) | `NOW()` in an update request of three operations, with a time set in advance in the context | every call in one query execution returns the same value, and an update request is not specified | not probed | not probed. Jena ARQ 6.2.0: ✘ the time set is overwritten, and each operation reads the clock again | Source, Observed |
+| [TSD-77](#tsd-77-a-decimal-sum-or-product-keeps-its-scale-on-rdflib-and-is-canonical-on-oxigraph) | `29.50 * 12` and `1.10 + 2.20` | the value, its lexical form not stated | `"354.00"`, `"3.30"`, the operands' scale kept | `"354"`, `"3.3"`, canonical (0.5.13) | Observed |
+| [TSD-78](#tsd-78-a-float-or-double-divided-by-zero-is-unbound-on-rdflib-and-infinity-on-oxigraph) | a float or double, and a decimal, divided by zero | `INF` for a float or double, an error for a decimal | ✘ unbound for both | ✔ `INF`, and unbound for a decimal (0.5.13) | Observed, Documented |
 
 ## 6. The findings
 
@@ -2096,6 +2098,55 @@ public class Probe {
     }
 }
 ```
+
+### TSD-77. A decimal sum or product keeps its scale on rdflib and is canonical on Oxigraph
+
+**Evidence:** Observed on rdflib 7.6.0 and Oxigraph 0.5.13 through `pyoxigraph`, Python 3.14.10 on an x86_64 Linux container, 2026-11-24, by a compiler's tests that run a derived value on both engines and by a probe written apart from them. Source not read.
+
+**Context.** A compiled mapping wrote a value derived by arithmetic, a monthly price times the periods in a year, onto each instance, and its tests ran it on both engines. The two engines wrote the same value under different terms.
+
+**What the store does.**
+
+```sparql
+SELECT ?v WHERE { BIND(29.50 * 12 AS ?v) }
+SELECT ?v WHERE { BIND(1.10 + 2.20 AS ?v) }
+```
+
+| Store | `29.50 * 12` | `1.10 + 2.20` |
+|---|---|---|
+| rdflib 7.6.0 | `"354.00"^^xsd:decimal` | `"3.30"^^xsd:decimal` |
+| Oxigraph 0.5.13 | `"354"^^xsd:decimal` | `"3.3"^^xsd:decimal` |
+
+**Why.** Not read. rdflib's result keeps the scale of its operands, as Python's `Decimal` arithmetic does, and Oxigraph writes the canonical form of the value, with no trailing zero. The two terms are equal values and different RDF terms.
+
+**What it means for a project.** A value derived by arithmetic compares equal by value on both engines and differs as a term, so anything that compares terms differs: `sameTerm`, `DISTINCT`, a graph's isomorphism, a canonical serialisation and a digest of one. A test of a derived decimal compares values, and a digest over a derived decimal is taken of a canonical form the project writes itself, never of the engine's term.
+
+**Reproduce it.** With `rdflib` and `pyoxigraph` installed, run each query above with `rdflib.Graph().query(q)` and `pyoxigraph.Store().query(q)`, and print the bound term's N-Triples form.
+
+### TSD-78. A float or double divided by zero is unbound on rdflib and infinity on Oxigraph
+
+**Evidence:** Observed on rdflib 7.6.0 and Oxigraph 0.5.13 through `pyoxigraph`, Python 3.14.10 on an x86_64 Linux container, 2026-11-24, by a compiler's tests and by a probe written apart from them. Documented, since SPARQL 1.1 takes `/` from XPath's `op:numeric-divide`, under which a float or double divided by zero is an infinity or NaN and a decimal or integer divided by zero is an error. Source not read.
+
+**Context.** A compiled quotient had to say what a division by zero gives, and its tests ran it on both engines.
+
+**What the store does.**
+
+```sparql
+SELECT ?v WHERE { BIND("1.0"^^xsd:double / "0"^^xsd:double AS ?v) }
+SELECT ?v WHERE { BIND(1.0 / 0 AS ?v) }
+```
+
+| Store | double or float by zero | decimal by zero |
+|---|---|---|
+| specification | `INF` | error, so unbound |
+| rdflib 7.6.0 | unbound | unbound |
+| Oxigraph 0.5.13 | `"INF"^^xsd:double`, and `"INF"^^xsd:float` for a float | unbound |
+
+**Why.** Not read. Oxigraph follows XPath's division. rdflib raises an error for every numeric type, so it departs from the specification for a float or a double.
+
+**What it means for a project.** A query that divides floats or doubles answers differently on the two engines where the divisor is zero. A project that wants one answer guards the divisor, for example `?n / IF(?d != 0, ?d, ?undefined)`, which leaves the result unbound on both. The departure is rdflib's to report upstream, if anyone does.
+
+**Reproduce it.** As TSD-77, with the two queries above.
 
 ## 7. Corrections, and what they taught us
 
