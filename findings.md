@@ -230,6 +230,7 @@ The two are not interchangeable. Some functions accept only a variable (`BOUND`)
 | [TSD-77](#tsd-77-a-decimal-sum-or-product-keeps-its-scale-on-rdflib-and-is-canonical-on-oxigraph) | `29.50 * 12` and `1.10 + 2.20` | the value, its lexical form not stated | `"354.00"`, `"3.30"`, the operands' scale kept | `"354"`, `"3.3"`, canonical (0.5.13) | Observed |
 | [TSD-78](#tsd-78-a-float-or-double-divided-by-zero-is-unbound-on-rdflib-and-infinity-on-oxigraph) | a float or double, and a decimal, divided by zero | `INF` for a float or double, an error for a decimal | ✘ unbound for both | ✔ `INF`, and unbound for a decimal (0.5.13) | Observed, Documented |
 | [TSD-79](#tsd-79-rdflib-evaluates-a-sub-select-with-the-outer-querys-bindings-where-sparql-evaluates-it-on-its-own) | a grouped sub-select that reuses an outer variable it does not project | evaluated on its own, the variable local to it | ✘ the outer bindings fed in | ✔ (0.5.13) | Observed, Documented |
+| [TSD-80](#tsd-80-a-later-operation-of-one-update-request-sees-what-an-earlier-one-wrote-so-a-receipt-written-first-can-gate-the-rest-on-rdflib-oxigraph-and-jena-in-memory) | a request whose first operation inserts a marker under a guard over several rows, and whose later operations each require the marker | the operations of a request take effect in the order written | ✔ every later operation applies where the guard held and none where it did not (7.6.0) | ✔ the same (0.5.13). Jena ARQ 5.1.0 in memory: ✔ the same | Observed |
 
 ## 6. The findings
 
@@ -2176,6 +2177,46 @@ SELECT ?o ?c WHERE {
 **What it means for a project.** A sub-select that counts or groups gives a different answer on rdflib wherever it reuses the name of an outer variable it does not project. Name a sub-select's own variables apart from the outer query's, which gives the specification's answer on both engines. The departure is rdflib's to report upstream, if anyone does.
 
 **Reproduce it.** With `rdflib` and `pyoxigraph` installed, load the five triples above, with `urn:` IRIs, and run the query on `rdflib.Graph()` and `pyoxigraph.Store()`.
+
+### TSD-80. A later operation of one update request sees what an earlier one wrote, so a receipt written first can gate the rest, on rdflib, Oxigraph and Jena in memory
+
+**Evidence:** Observed, by three conformance tests of LATTICE's persistence compiler, `test_store_probes.py`, on rdflib 7.6.0, Oxigraph 0.5.13 through `pyoxigraph` and Apache Jena ARQ 5.1.0 in memory, 2026-11-24, Python 3.14.7 on an arm64 laptop running macOS. Not measured: Fuseki over TDB2, Oxigraph on disk, a request sent over HTTP, and two requests at once.
+
+**Context.** A command that writes several rows must apply whole or not at all. Its operations cannot share one `WHERE`, since two of them end in an `OPTIONAL` that sweeps a graph and two sweeps in one pattern multiply. We wanted to know whether one request can instead write a receipt first, under a guard over every row the command touches, and have each later operation require that receipt beside its own row guard.
+
+**How we found it.**
+
+1. *A receipt first, then two operations.* One request of three operations, on a store holding two rows. The first inserts the receipt where both rows are at the revision planned and no receipt exists. The second and third each move one row where the receipt exists and the row is at its revision. Run with the rows as planned, and with one row moved.
+2. *A guard over a list of rows.* The same request with the guard written as a `VALUES` list inside `FILTER NOT EXISTS`, so one pattern says every listed row is at its revision and every row to create is absent. Run with every row as planned, one moved, one missing, and one that should be absent present.
+3. *The size of the list.* Thirty listed rows among a thousand others, and once among five thousand.
+
+**What the store does.**
+
+```sparql
+INSERT { GRAPH <urn:r> { <urn:unit> <urn:p> <urn:receipt> } }
+WHERE {
+  FILTER NOT EXISTS { VALUES (?root ?seq) { (<urn:a> 1) (<urn:b> 4) }
+                      FILTER NOT EXISTS { GRAPH <urn:m> { ?root <urn:seq> ?seq } } }
+  FILTER NOT EXISTS { VALUES ?new { <urn:c> } GRAPH <urn:m> { ?new <urn:seq> ?any } }
+  FILTER NOT EXISTS { GRAPH <urn:r> { <urn:unit> ?p ?o } }
+} ;
+DELETE { GRAPH <urn:m> { <urn:a> <urn:seq> 1 } }
+INSERT { GRAPH <urn:m> { <urn:a> <urn:seq> 2 ; <urn:done> <urn:yes> } }
+WHERE { GRAPH <urn:r> { <urn:unit> <urn:p> <urn:receipt> } GRAPH <urn:m> { <urn:a> <urn:seq> 1 } } ;
+DELETE { GRAPH <urn:m> { <urn:b> <urn:seq> 4 } }
+INSERT { GRAPH <urn:m> { <urn:b> <urn:seq> 5 ; <urn:done> <urn:yes> } }
+WHERE { GRAPH <urn:r> { <urn:unit> <urn:p> <urn:receipt> } GRAPH <urn:m> { <urn:b> <urn:seq> 4 } }
+```
+
+On all three engines, with every row as planned the receipt is written and both rows move. In every other case, a row moved, a row missing or a row to create already present, the receipt is not written and neither row moves. The later operations see the receipt the first wrote in the same request, and see its absence.
+
+Thirty listed rows among a thousand gave the same answers on each engine. Among five thousand, observed once and not a benchmark, the request took 0.01 s on Oxigraph, 0.11 s on Jena and 31.5 s on rdflib.
+
+**Why.** SPARQL 1.1 Update has the operations of a request take effect in the order they are written, each on the store the one before it left. The three engines keep that for an operation that reads a graph an earlier operation of the request wrote. rdflib's cost follows TSD-75, a pattern inside a named graph scanning the store for its predicate.
+
+**What it means for a project.** A command over several rows can be lowered to one request, its receipt first under a joint guard and every other operation requiring the receipt, where the store applies a request as one transaction (TSD-06, TSD-66). The guard decides once, so no later operation can apply alone. Each operation keeps its own `WHERE`, so no two sweeps meet in one pattern. It does not by itself hold against a second writer on a store that lets concurrent updates through (TSD-73). On rdflib keep the listed rows and the store small in a test.
+
+**Reproduce it.** Load two rows, `<urn:a> <urn:seq> 1` and `<urn:b> <urn:seq> 4`, into graph `<urn:m>`, send the request above, and read graphs `<urn:r>` and `<urn:m>`. Then change `<urn:b>` to 5 before sending and read them again.
 
 ## 7. Corrections, and what they taught us
 
