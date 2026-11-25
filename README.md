@@ -12,4 +12,8 @@ This domain holds what we found out about working with RDF triple stores and SPA
 
 A finding holds for the versions it names and no others, until it is checked again. Read its first lines for the evidence, which is one or more of Source (we read the code at a named version), Observed (we ran a probe), Documented (the tool's own documentation says so) and Reasoned (a hypothesis not yet observed). An Observed finding names a run record, `R-A` and so on, in the table in section 1 of `findings.md`, with the kind of machine, the Python version and the store versions. A statement about cost says whether it holds on any engine or only on the one measured.
 
+## Versions
+
+A project may follow this domain's `main` branch. Findings are added and seldom changed, and a new finding changes none before it. The domain's version moves, and a tag marks it, only where the meaning of a recorded finding changes: a finding is corrected, or is marked as remedied in a release of the store it is about. A project that relied on the earlier text can then cite the tag that holds it. A finding's heading is its link, so a heading is reworded only with such a change.
+
 [MIT](LICENSE)
